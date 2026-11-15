@@ -1,106 +1,151 @@
-# Multi-Platform Posting System
+# Automated Multi-Platform Posting System
 
-Write a post once, deliver it to several platforms independently, retry only the
-deliveries that failed, and do not publish twice when a request is retried or two
-worker ticks overlap.
+One `POST /posting` takes a short message with a call-to-action link and publishes it
+to six platforms independently, then reports a per-platform result: status, the
+published URL, whether that URL is publicly accessible, date, time, and the error if
+the platform refused.
 
-FastAPI + SQLite, no external services required to run it. `DRY_RUN=1` is the
-default, so the whole pipeline is reviewable without a single API key.
+Built with FastAPI, Pydantic, HTTPX and Python 3.11. Ships in dry-run mode, so the
+whole API is reviewable before a single credential exists.
 
-## Quickstart (no credentials)
+## Run it
 
 ```bash
-python -m venv .venv && . .venv/Scripts/activate    # Windows
+python -m venv .venv && . .venv/Scripts/activate     # Windows
+# source .venv/bin/activate                          # macOS / Linux
 pip install -r requirements.txt
-uvicorn app.main:app --reload
+uvicorn app.main:app --host 0.0.0.0 --port 4000
 ```
+
+Interactive docs: <http://localhost:4000/docs>
+
+## Test it
 
 ```bash
-curl -s localhost:8000/posts -H "Content-Type: application/json" \
-  -H "Idempotency-Key: launch-post-1" \
-  -d '{"content":"Shipping the posting service today.","platforms":["telegram","mastodon"]}'
-
-curl -s -X POST localhost:8000/tick        # drive the worker now (a background loop also runs)
-curl -s localhost:8000/posts/<id>          # status: posted, per platform
-cat var/mock_outbox.jsonl                  # what would have been published
+curl -s localhost:4000/posting -H "Content-Type: application/json" -d '{
+  "message": "Check out our latest business platform and grow your online visibility. https://example.com"
+}'
 ```
 
-With `DRY_RUN=1` the scheduler delivers to an outbox file, so the response shape,
-retry behaviour and status transitions are all exercised end to end. Set
-`SCHEDULER_ENABLED=0` if you would rather step it with `/tick` only.
+Default output (`DRY_RUN=1`, no credentials needed) — this is an actual response from
+the run on this machine:
 
-Live mode: copy `.env.example` to `.env`, set `DRY_RUN=0` and the credentials for
-the platforms you want. Telegram is a bot token + chat id, Mastodon a base URL +
-token, Dev.to an API key (Dev.to also requires a `title`).
-
-## Architecture
-
-```
-POST /posts ──► posts table
-                 │
-                 └─► attempts table (one row per post × platform, status=pending)
-                          │
- scheduler (asyncio) ─────┘  every SCHEDULER_INTERVAL seconds:
-   select due attempts → claim (pending→sending) → adapter.send() → posted
-                                                                    └─► on error: attempts+1,
-                                                                        next_attempt_at = now + backoff,
-                                                                        back to pending
-                                                     give up after MAX_ATTEMPTS
+```json
+{
+  "success": true,
+  "dry_run": true,
+  "results": [
+    {"platform": "Telegram", "status": "dry_run", "posted_url": null, "public_access": false, "date": null, "time": null, "error": null},
+    {"platform": "Mastodon", "status": "dry_run", "posted_url": null, "public_access": false, "date": null, "time": null, "error": null},
+    {"platform": "Bluesky",  "status": "dry_run", "posted_url": null, "public_access": false, "date": null, "time": null, "error": null},
+    {"platform": "Dev.to",   "status": "dry_run", "posted_url": null, "public_access": false, "date": null, "time": null, "error": null},
+    {"platform": "Discord",  "status": "dry_run", "posted_url": null, "public_access": false, "date": null, "time": null, "error": null},
+    {"platform": "Slack",    "status": "dry_run", "posted_url": null, "public_access": false, "date": null, "time": null, "error": null}
+  ]
+}
 ```
 
-Each platform is an independent row, so a Telegram outage cannot block Mastodon,
-and a failure is retried on its own schedule instead of re-publishing the ones
-that already succeeded.
+With `DRY_RUN=0` and credentials in place, each entry becomes the real result:
 
-## API
+```json
+{
+  "success": true,
+  "dry_run": false,
+  "results": [
+    {"platform": "Telegram", "status": "success", "posted_url": "https://t.me/my_channel/42",
+     "public_access": true, "date": "2026-11-15", "time": "10:30:00", "error": null},
+    {"platform": "Mastodon", "status": "failed", "posted_url": null, "public_access": false,
+     "date": null, "time": null, "error": "MASTODON_TOKEN is not set"}
+  ]
+}
+```
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| `POST` | `/posts` | Queue a post (optional `Idempotency-Key` header) |
-| `GET` | `/posts` | List recent posts |
-| `GET` | `/posts/{id}` | One post with per-platform attempts |
-| `POST` | `/posts/{id}/retry` | Reset failed deliveries to pending |
-| `POST` | `/tick` | Run the worker once (deterministic, used by tests) |
-| `GET` | `/health` | DB check + dry-run flag + queue depth |
-| `GET` | `/platforms` | Supported names and per-platform limits |
+`success` is `false` only when **every** platform failed; partial results are reported
+per platform, which is what the other five entries are for. Times are UTC.
 
-Status values: `scheduled` → `partial` → `posted` / `failed`. An attempt is also
-briefly `sending` while a worker owns it; that state is internal and never
-returned as a post status.
+## Validation
 
-## Design decisions
+| Rule | Behaviour |
+| --- | --- |
+| Message must not be empty | `422` `{"detail": {"message": "must not be empty"}}` |
+| Message must be ≤ 200 characters | `422` with `length` in the detail |
+| Exactly one link | `422` with `links_found` |
+| Link must be a valid `http(s)` URL with a host | `422` with the offending `link` |
 
-**One attempts row per platform.** A single `status` column on the post forces
-you to either re-send everything or track state in prose. Per-platform rows make
-retry, backoff and partial success explicit, and give the reviewer a table that
-explains what happened without reading logs.
+```bash
+$ curl -s localhost:4000/posting -H "Content-Type: application/json" \
+    -d '{"message":"a https://example.com b https://example.org"}'
+{"detail":{"message":"must contain exactly one link","links_found":2}}
 
-**Idempotency at the API boundary.** Mobile clients and retries from a load
-balancer both duplicate requests. A unique `idempotency_key` is inserted inside
-the same transaction as the post, and a duplicate key returns the original post
-instead of publishing twice — including when two requests race, where the loser
-catches the unique-constraint violation and re-reads the winner.
+$ curl -s localhost:4000/posting -H "Content-Type: application/json" \
+    -d '{"message":"click https://localhost"}'
+{"detail":{"message":"the link is not a valid http(s) URL","link":"https://localhost"}}
+```
 
-**Claim before send.** A tick first flips a due row from `pending` to `sending`
-with a conditional `UPDATE ... WHERE status = 'pending'`, and only the worker
-that changed one row sends it. The scheduler and `POST /tick` can therefore
-overlap without double-publishing. A row still `sending` after five minutes is
-assumed to belong to a dead process and is returned to the queue — that case is
-at-least-once, which is the honest trade-off versus a permanently stuck delivery.
+Platform selection is internal (`ENABLED_PLATFORMS` in `.env`); the caller only sends
+a message, exactly as the brief requires.
 
-**Exponential backoff with server-provided hints.** `2^n` seconds capped at 300,
-but `Retry-After` / Telegram's `parameters.retry_after` win when present — the
-platform knows better than a generic curve. Non-retryable errors (bad token,
-missing title) fail on the first attempt instead of burning five.
+## Platforms
 
-**Validation before the queue, per platform.** Mastodon is 500 characters,
-Telegram 4096, Dev.to a long-form article. A post that exceeds the limit of any
-requested platform is rejected with a 422 naming the platform and the limit, so
-the failure happens at write time rather than at 2 a.m. in the scheduler.
+| Platform | Official API | Credentials | `posted_url` | `public_access` |
+| --- | --- | --- | --- | --- |
+| Telegram | [Bot API `sendMessage`](https://core.telegram.org/bots/api#sendmessage) | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | `https://t.me/<channel>/<msg_id>` | `true` only for public channels |
+| Mastodon | [`POST /api/v1/statuses`](https://docs.joinmastodon.org/methods/statuses/#create) | `MASTODON_BASE_URL`, `MASTODON_TOKEN` | status URL from the response | `true` when visibility is `public` |
+| Bluesky | [AT Protocol `createRecord`](https://docs.bsky.app/docs/advanced-guides/posts) | `BLUESKY_HANDLE`, `BLUESKY_APP_PASSWORD` | `https://bsky.app/profile/<handle>/post/<rkey>` | `true` |
+| Dev.to | [Forem API `POST /api/articles`](https://developers.forem.com/api/v1#tag/articles) | `DEVTO_API_KEY` | article URL | `true` when published |
+| Discord | [Webhook execute](https://discord.com/developers/docs/resources/webhook#execute-webhook) | `DISCORD_WEBHOOK_URL` | `https://discord.com/channels/<guild>/<channel>/<msg>` | `false` — a webhook can target a private channel |
+| Slack | [Incoming webhooks](https://api.slack.com/messaging/webhooks) | `SLACK_WEBHOOK_URL` | `null` — webhooks return no message id | `false` |
 
-**`/tick` next to the scheduler.** The background loop is the production path, but
-exposing one tick makes the worker testable without `sleep()` — the tests move
-the clock forward and assert the exact backoff timestamps.
+The link is turned into a real Bluesky rich-text facet (byte offsets, as the AT
+Protocol requires), so it renders as a clickable link rather than plain text. Dev.to
+requires a title, so one is derived from the message with the URL removed.
+
+### What I deliberately left out
+
+X/Twitter, LinkedIn, Reddit and Tumblr all need OAuth apps, developer approval or paid
+tiers, which a reviewer cannot exercise. The six above authenticate with a token,
+app password or webhook URL, so every integration is testable end to end without
+waiting on platform approval. `app/platforms/__init__.py` is a registry: adding a
+platform is one class with `name` and `async publish(message) -> (url, public)`, plus
+one line in the registry and its variables in `.env.example`.
+
+## Design
+
+```
+app/
+├── main.py                      # POST /posting, /health, /platforms
+├── schemas.py                   # request + response models
+├── config.py                    # settings from environment
+├── validation.py                # 200 chars, exactly one link, URL check
+├── platforms/
+│   ├── __init__.py              # registry, dry-run stand-ins
+│   ├── base.py                  # PlatformError, credential helper
+│   ├── telegram.py  mastodon.py  bluesky.py
+│   ├── devto.py     discord.py   slack.py
+└── services/
+    └── posting_service.py       # fan-out and per-platform result mapping
+```
+
+**Fan-out, not a loop of awaits.** `asyncio.gather` runs the six integrations
+concurrently, so the response takes as long as the slowest platform, not the sum.
+Each coroutine converts its own exceptions into a result row, which is why one
+failure cannot stop the rest or abort the response.
+
+**Two error classes.** `PlatformError` means "this platform refused", and its message
+becomes the `error` field. Anything else is an adapter bug and is still contained, with
+the exception type in `error` so it is visible without reading server logs.
+
+**No retries inside the request.** The contract is one synchronous call with a
+per-platform result. A retry loop would stretch the request past the caller's timeout
+and could publish twice; failures are reported honestly and the caller decides.
+
+**Dry-run by default.** `DRY_RUN=1` swaps each integration for a stand-in that touches
+nothing and reports `dry_run`, so the schema, validation and fan-out can be reviewed
+and tested without credentials. There is no way to mistake a dry run for a publish:
+the response carries `dry_run: true` and no platform claims success.
+
+**Credentials only from the environment.** `.env` is gitignored; `.env.example` holds
+blank placeholders and nothing else is committed.
 
 ## Tests
 
@@ -108,16 +153,16 @@ the clock forward and assert the exact backoff timestamps.
 pytest
 ```
 
-10 tests: dry-run delivery, idempotent retries, per-platform length validation,
-unknown platform rejection, exact backoff schedule, max-attempts failure,
-non-retryable errors, the retry endpoint, no double-send on a second tick, and
-reclaiming a stuck `sending` row. No network access, no keys.
+13 tests: the dry-run contract (six platforms, exact field set), 200-character
+boundary and over-length rejection, missing/two/invalid links, empty message, one
+failing platform leaving the others intact, all platforms failing reporting
+`success: false`, an unexpected adapter exception being contained, missing credentials
+reported per platform, the health/platforms endpoints, and an unknown platform name
+failing at startup. No network, no credentials.
 
-## What I would add with more than three hours
+## With more time
 
-- A real queue (Redis/SQS) and separate worker process, so the API never blocks
-  on a slow platform.
-- OAuth token refresh per platform, and per-platform rate-limit budgets.
-- Media attachments and per-platform formatting (threads for X, tags for Mastodon).
-- Metrics on queue age and failure rate, plus a dead-letter view.
-- Webhook callbacks so clients learn about a delivery without polling.
+- OAuth-based platforms (X, LinkedIn) behind the same registry.
+- Retry with idempotency keys for transient 5xx responses, outside the request.
+- Persist every result to SQLite so a posting history survives restarts.
+- Per-platform formatting: threads for X, tags for Mastodon, a longer body for Dev.to.

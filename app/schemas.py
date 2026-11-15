@@ -1,31 +1,23 @@
-from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
 
-class PostIn(BaseModel):
-    content: str = Field(min_length=1)
-    platforms: list[str] = Field(min_length=1)
-    title: str | None = None
-    scheduled_at: datetime | None = None
+class PostingRequest(BaseModel):
+    message: str = Field(min_length=1, description="Text to publish, max 200 characters, exactly one link")
 
 
-class AttemptOut(BaseModel):
+class PlatformResultOut(BaseModel):
     platform: str
-    status: str
-    attempts: int
-    next_attempt_at: str
-    last_error: str | None
-    remote_id: str | None
-    updated_at: str
+    status: Literal["success", "failed", "dry_run"]
+    posted_url: str | None = None
+    public_access: bool = False
+    date: str | None = None
+    time: str | None = None
+    error: str | None = None
 
 
-class PostOut(BaseModel):
-    id: str
-    content: str
-    title: str | None
-    platforms: list[str]
-    scheduled_at: str
-    created_at: str
-    status: str
-    attempts: list[AttemptOut]
+class PostingResponse(BaseModel):
+    success: bool
+    dry_run: bool = False
+    results: list[PlatformResultOut]
