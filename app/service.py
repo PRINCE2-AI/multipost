@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -16,6 +17,12 @@ class ValidationError(ValueError):
 
 class NotFound(LookupError):
     pass
+
+
+# A delivery stuck in 'sending' longer than this is assumed to belong to a dead
+# process and is handed back to the queue. Sending again is at-least-once, which
+# is why the claim is only reclaimed after a crash window.
+STALE_SEND_SECONDS = 300
 
 
 def _normalise_platforms(platforms: list[str]) -> list[str]:
@@ -47,7 +54,7 @@ def _status_for(rows) -> str:
     states = [r["status"] for r in rows]
     if all(s == "posted" for s in states):
         return "posted"
-    if any(s == "pending" for s in states):
+    if any(s in {"pending", "sending"} for s in states):
         return "partial" if any(r["attempts"] for r in rows) else "scheduled"
     return "failed"
 
@@ -104,17 +111,28 @@ def create_post(settings: Settings, *, content: str, platforms: list[str],
 
     post_id = uuid.uuid4().hex
     created = now_iso()
-    with connect(settings.db_path) as conn:
-        conn.execute(
-            "INSERT INTO posts (id, content, title, platforms, scheduled_at, created_at, idempotency_key)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (post_id, content, title, json.dumps(names), when, created, idempotency_key),
-        )
-        conn.executemany(
-            "INSERT INTO attempts (post_id, platform, status, attempts, next_attempt_at, updated_at)"
-            " VALUES (?, ?, 'pending', 0, ?, ?)",
-            [(post_id, name, when, created) for name in names],
-        )
+    try:
+        with connect(settings.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO posts (id, content, title, platforms, scheduled_at, created_at, idempotency_key)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (post_id, content, title, json.dumps(names), when, created, idempotency_key),
+            )
+            conn.executemany(
+                "INSERT INTO attempts (post_id, platform, status, attempts, next_attempt_at, updated_at)"
+                " VALUES (?, ?, 'pending', 0, ?, ?)",
+                [(post_id, name, when, created) for name in names],
+            )
+    except sqlite3.IntegrityError:
+        # Lost the race on the unique idempotency key: return the winner's post.
+        with connect(settings.db_path) as conn:
+            existing = conn.execute(
+                "SELECT id FROM posts WHERE idempotency_key = ?", (idempotency_key,)
+            ).fetchone()
+        if existing is None:
+            raise
+        return get_post(settings, existing["id"])
     return get_post(settings, post_id)
 
 
@@ -133,11 +151,12 @@ def retry_post(settings: Settings, post_id: str) -> dict:
 
 
 async def tick(settings: Settings, now: datetime | None = None) -> int:
-    """Process every delivery attempt that is due. Returns attempts processed."""
+    """Process every delivery attempt that is due. Returns attempts claimed."""
     moment = now or datetime.now(timezone.utc)
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
     now_s = now_iso(moment)
+    _reclaim_stale(settings, moment)
 
     with connect(settings.db_path) as conn:
         due = conn.execute(
@@ -150,6 +169,8 @@ async def tick(settings: Settings, now: datetime | None = None) -> int:
 
     processed = 0
     for row in due:
+        if not _claim(settings, row["post_id"], row["platform"], now_s):
+            continue  # another worker claimed it between the select and now
         processed += 1
         attempts = row["attempts"] + 1
         try:
@@ -167,6 +188,26 @@ async def tick(settings: Settings, now: datetime | None = None) -> int:
                     (attempts, remote_id, now_s, row["post_id"], row["platform"]),
                 )
     return processed
+
+
+def _claim(settings: Settings, post_id: str, platform: str, now_s: str) -> bool:
+    with connect(settings.db_path) as conn:
+        cur = conn.execute(
+            "UPDATE attempts SET status = 'sending', updated_at = ?"
+            " WHERE post_id = ? AND platform = ? AND status = 'pending'",
+            (now_s, post_id, platform),
+        )
+        return cur.rowcount == 1
+
+
+def _reclaim_stale(settings: Settings, moment: datetime) -> None:
+    cutoff = now_iso(moment - timedelta(seconds=STALE_SEND_SECONDS))
+    with connect(settings.db_path) as conn:
+        conn.execute(
+            "UPDATE attempts SET status = 'pending', last_error = 'reclaimed after stale send',"
+            " updated_at = ? WHERE status = 'sending' AND updated_at < ?",
+            (now_iso(moment), cutoff),
+        )
 
 
 def _record_failure(settings: Settings, row, attempts: int, error: str,
@@ -187,7 +228,7 @@ def _record_failure(settings: Settings, row, attempts: int, error: str,
     next_at = now_iso(moment + timedelta(seconds=delay))
     with connect(settings.db_path) as conn:
         conn.execute(
-            "UPDATE attempts SET attempts = ?, last_error = ?, next_attempt_at = ?,"
-            " updated_at = ? WHERE post_id = ? AND platform = ?",
+            "UPDATE attempts SET status = 'pending', attempts = ?, last_error = ?,"
+            " next_attempt_at = ?, updated_at = ? WHERE post_id = ? AND platform = ?",
             (attempts, error[:500], next_at, now_iso(moment), row["post_id"], row["platform"]),
         )

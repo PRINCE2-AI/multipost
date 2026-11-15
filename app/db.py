@@ -29,11 +29,25 @@ CREATE INDEX IF NOT EXISTS idx_attempts_due
 """
 
 
-def connect(path: str) -> sqlite3.Connection:
+class Connection(sqlite3.Connection):
+    """Autocommit connection that also closes itself at the end of a `with` block."""
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is None:
+                self.commit()
+            else:
+                self.rollback()
+        finally:
+            self.close()
+        return False
+
+
+def connect(path: str) -> Connection:
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=10, isolation_level=None)
+    conn = sqlite3.connect(path, timeout=10, isolation_level=None, factory=Connection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")

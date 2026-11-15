@@ -124,3 +124,28 @@ def test_health_and_platforms(client):
     assert health["status"] == "ok" and health["dry_run"] is True
     supported = client.get("/platforms").json()["supported"]
     assert {"telegram", "mastodon", "devto", "mock"} <= set(supported)
+
+
+def test_tick_twice_does_not_resend(client, settings):
+    client.post("/posts", json={"content": "exactly once", "platforms": ["telegram", "mastodon"]})
+    assert client.post("/tick").json()["processed"] == 2
+    assert client.post("/tick").json()["processed"] == 0
+    lines = open(settings.outbox_path, encoding="utf-8").read().splitlines()
+    assert len(lines) == 2
+
+
+def test_stale_sending_attempt_is_reclaimed(settings):
+    import asyncio
+
+    from app.db import connect, init_db
+
+    init_db(settings.db_path)
+    post = service.create_post(settings, content="stuck mid-send", platforms=["telegram"])
+    with connect(settings.db_path) as conn:
+        conn.execute(
+            "UPDATE attempts SET status = 'sending', updated_at = ? WHERE post_id = ?",
+            ("2020-01-01T00:00:00.000000Z", post["id"]),
+        )
+
+    asyncio.run(service.tick(settings))
+    assert service.get_post(settings, post["id"])["status"] == "posted"
