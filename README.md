@@ -85,6 +85,13 @@ $ curl -s localhost:4000/posting -H "Content-Type: application/json" \
 Platform selection is internal (`ENABLED_PLATFORMS` in `.env`); the caller only sends
 a message, exactly as the brief requires.
 
+## Captured run
+
+[`docs/sample-run.log`](docs/sample-run.log) is the real terminal output of a fresh run:
+`pytest` (13 passed), uvicorn on port 4000, `/docs` returning 200, `/health`, the brief's
+sample request returning six per-platform rows, and a two-link request rejected with 422.
+No `.env` was present, so it ran in dry-run mode.
+
 ## Platforms
 
 | Platform | Official API | Credentials | `posted_url` | `public_access` |
