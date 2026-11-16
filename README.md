@@ -92,6 +92,17 @@ a message, exactly as the brief requires.
 sample request returning six per-platform rows, and a two-link request rejected with 422.
 No `.env` was present, so it ran in dry-run mode.
 
+The same log then shows a **live** run with `DRY_RUN=0 ENABLED_PLATFORMS=telegram` and a real
+bot token in `.env` — one row, `status` `success`, the timestamp returned by the API:
+
+```json
+{"success":true,"dry_run":false,"results":[{"platform":"Telegram","status":"success","posted_url":null,"public_access":false,"date":"2026-11-16","time":"19:36:17","error":null}]}
+```
+
+`posted_url` is `null` and `public_access` is `false` because that run targeted a private
+chat, which has no public `t.me` username. Pointing `TELEGRAM_CHAT_ID` at a **public channel**
+where the bot is an admin returns `https://t.me/<channel>/<message_id>` and `true`.
+
 ## Platforms
 
 | Platform | Official API | Credentials | `posted_url` | `public_access` |

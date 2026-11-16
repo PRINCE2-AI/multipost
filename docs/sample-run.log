@@ -35,3 +35,26 @@ INFO:     127.0.0.1:51537 - "POST /posting HTTP/1.1" 422 Unprocessable Entity
 
 # Set DRY_RUN=false and fill .env to post for real; each row then reports
 # status "success"/"failed" with the live posted_url instead of "dry_run".
+
+
+=====================================================================
+LIVE RUN — 2026-11-16 19:36 UTC, a real Telegram bot posting to a real chat
+=====================================================================
+# This machine's NO_PROXY contains an IPv6 entry ("[::1]") that this httpx
+# version rejects while building client mounts, so it is unset for the run.
+
+$ env -u NO_PROXY -u no_proxy DRY_RUN=0 ENABLED_PLATFORMS=telegram \
+    python -m uvicorn app.main:app --host 0.0.0.0 --port 4000
+INFO:     Started server process [17772]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:4000 (Press CTRL+C to quit)
+
+$ curl -s -X POST http://localhost:4000/posting -H "Content-Type: application/json" \
+    -d '{"message":"Check out our latest business platform and grow your online visibility. https://example.com"}'
+{"success":true,"dry_run":false,"results":[{"platform":"Telegram","status":"success","posted_url":null,"public_access":false,"date":"2026-11-16","time":"19:36:17","error":null}]}
+
+# status/time come from the Telegram response itself. posted_url is null and
+# public_access is false because the target is a private chat, which has no
+# public t.me username; a public channel where the bot is an admin returns
+# https://t.me/<channel>/<message_id> and public_access true.
